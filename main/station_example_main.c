@@ -6,32 +6,36 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "nvs_flash.h"
+#include <string.h>
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
 #include "driver/ledc.h"
 
 #include "esp_http_server.h"
 
-/* The examples use WiFi configuration that you can set via project configuration menu
+#include "hiesp.h"
+
+/* The examples use WiFi configuration that you can set via project
+   configuration menu
 
    If you'd rather not, just change the below entries to strings with
    the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
 */
-#define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
-#define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
-#define EXAMPLE_ESP_MAXIMUM_RETRY  CONFIG_ESP_MAXIMUM_RETRY
+#define EXAMPLE_ESP_WIFI_SSID CONFIG_ESP_WIFI_SSID
+#define EXAMPLE_ESP_WIFI_PASS CONFIG_ESP_WIFI_PASSWORD
+#define EXAMPLE_ESP_MAXIMUM_RETRY CONFIG_ESP_MAXIMUM_RETRY
 
 #if CONFIG_ESP_STATION_EXAMPLE_WPA3_SAE_PWE_HUNT_AND_PECK
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
@@ -64,255 +68,428 @@
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 
-/* The event group allows multiple bits for each event, but we only care about two events:
+/* The event group allows multiple bits for each event, but we only care about
+ * two events:
  * - we are connected to the AP with an IP
  * - we failed to connect after the maximum amount of retries */
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+#define WIFI_FAIL_BIT BIT1
 
 // ---- 舵机 & PWM 配置 ----
-#define SERVO_GPIO       GPIO_NUM_2        // 信号线接到 GPIO2
-#define SERVO_FREQ_HZ    50                // 舵机标准 50 Hz
-#define SERVO_TIMER      LEDC_TIMER_0
-#define SERVO_MODE       LEDC_LOW_SPEED_MODE
-#define SERVO_CHANNEL    LEDC_CHANNEL_0
-#define SERVO_RES_BITS   LEDC_TIMER_10_BIT // 10 位分辨率（0‥1023）
+#define SERVO_GPIO GPIO_NUM_10 // 信号线接到 GPIO10
+#define SERVO_FREQ_HZ 50       // 舵机标准 50 Hz
+#define SERVO_TIMER LEDC_TIMER_0
+#define SERVO_MODE LEDC_LOW_SPEED_MODE
+#define SERVO_CHANNEL LEDC_CHANNEL_0
+#define SERVO_RES_BITS LEDC_TIMER_10_BIT // 10 位分辨率（0‥1023）
+
+// —— I2S 通道配置 ——
+// 我们用 I2S0，ESP32 作为 Master，INMP441 作为 Slave
+#define I2S_PORT (I2S_NUM_0)
+#define SAMPLE_RATE (16000) // 16 kHz
+
+// 麦克风线路对应的 GPIO
+#define I2S_BCLK_IO GPIO_NUM_2 // I2S bit clock io number
+#define I2S_WS_IO GPIO_NUM_3   // I2S word select io number
+#define I2S_DOUT_IO GPIO_NUM_4 // I2S data out io number
+#define I2S_DIN_IO GPIO_NUM_5  // I2S data in io number
+
+#define EXAMPLE_BUFF_SIZE 2048
 
 static const char *TAG = "wifi station";
 
-static int s_retry_num = 0;
-
-
-static void event_handler(void* arg, esp_event_base_t event_base,
-                                int32_t event_id, void* event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI(TAG,"connect to the AP fail");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-void wifi_init_sta(void)
-{
-    s_wifi_event_group = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_netif_init());
-
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = EXAMPLE_ESP_WIFI_SSID,
-            .password = EXAMPLE_ESP_WIFI_PASS,
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
-            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
-            .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-    ESP_ERROR_CHECK(esp_wifi_start() );
-
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
-
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
-    } else {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
-    }
-}
+static i2s_chan_handle_t tx_chan; // I2S tx channel handler
+static i2s_chan_handle_t rx_chan; // I2S rx channel handler
 
 // 将角度映射到占空比（10-bit，0‥1023）
-static uint32_t angle_to_duty(int angle_deg)
-{
-    // 0° → 0.5ms ; 180° → 2.5ms ; 周期 = 20ms
-    // us = 500 + angle * (2000/180)
-    float us = 500.0f + (2000.0f * angle_deg / 180.0f);
-    // duty = us/20000us * 1023
-    return (uint32_t)(us * ((1<<SERVO_RES_BITS)-1) * SERVO_FREQ_HZ / 1e6f);
+static uint32_t angle_to_duty(int angle_deg) {
+  // 0° → 0.5ms ; 180° → 2.5ms ; 周期 = 20ms
+  // us = 500 + angle * (2000/180)
+  float us = 500.0f + (2000.0f * angle_deg / 180.0f);
+  // duty = us/20000us * 1023
+  return (uint32_t)(us * ((1 << SERVO_RES_BITS) - 1) * SERVO_FREQ_HZ / 1e6f);
 }
 
-static void servo_init(void)
-{
-    // 1）配置 PWM 定时器
-    ledc_timer_config_t timer = {
-        .speed_mode       = SERVO_MODE,
-        .timer_num        = SERVO_TIMER,
-        .duty_resolution  = SERVO_RES_BITS,
-        .freq_hz          = SERVO_FREQ_HZ,
-        .clk_cfg          = LEDC_AUTO_CLK,
-    };
-    ESP_ERROR_CHECK( ledc_timer_config(&timer) );
+static void i2s_init_std_duplex(void) {
+  /* Setp 1: Determine the I2S channel configuration and allocate both channels
+   * The default configuration can be generated by the helper macro,
+   * it only requires the I2S controller id and I2S role */
+  i2s_chan_config_t chan_cfg =
+      I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, &rx_chan));
 
-    // 2）配置 PWM 通道
-    ledc_channel_config_t ch = {
-        .speed_mode     = SERVO_MODE,
-        .channel        = SERVO_CHANNEL,
-        .timer_sel      = SERVO_TIMER,
-        .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = SERVO_GPIO,
-        .duty           = 0,  // 先 0 占空比
-        .hpoint         = 0,
-    };
-    ESP_ERROR_CHECK( ledc_channel_config(&ch) );
+  /* Step 2: Setting the configurations of standard mode, and initialize rx & tx
+   * channels The slot configuration and clock configuration can be generated by
+   * the macros These two helper macros is defined in 'i2s_std.h' which can only
+   * be used in STD mode. They can help to specify the slot and clock
+   * configurations for initialization or re-configuring */
+  i2s_std_config_t std_cfg = {
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
+      .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
+                                                  I2S_SLOT_MODE_STEREO),
+      .gpio_cfg =
+          {
+              .mclk = I2S_GPIO_UNUSED, // some codecs may require mclk signal,
+                                       // this example doesn't need it
+              .bclk = I2S_BCLK_IO,
+              .ws = I2S_WS_IO,
+              .dout = I2S_GPIO_UNUSED,
+              .din = I2S_DIN_IO, // In duplex mode, bind output and input to a
+                                 // same gpio can loopback internally
+              .invert_flags =
+                  {
+                      .mclk_inv = false,
+                      .bclk_inv = false,
+                      .ws_inv = false,
+                  },
+          },
+  };
+  /* Initialize the channels */
+  ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
+  ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &std_cfg));
 }
 
-static esp_err_t led_on_handler(httpd_req_t *req)
-{
+static void i2s_example_write_task(void *args) {
+  uint8_t *w_buf = (uint8_t *)calloc(1, EXAMPLE_BUFF_SIZE);
+  assert(w_buf); // Check if w_buf allocation success
+
+  /* Assign w_buf */
+  for (int i = 0; i < EXAMPLE_BUFF_SIZE; i += 8) {
+    w_buf[i] = 0x12;
+    w_buf[i + 1] = 0x34;
+    w_buf[i + 2] = 0x56;
+    w_buf[i + 3] = 0x78;
+    w_buf[i + 4] = 0x9A;
+    w_buf[i + 5] = 0xBC;
+    w_buf[i + 6] = 0xDE;
+    w_buf[i + 7] = 0xF0;
+  }
+
+  size_t w_bytes = EXAMPLE_BUFF_SIZE;
+
+  /* (Optional) Preload the data before enabling the TX channel, so that the
+   * valid data can be transmitted immediately */
+  while (w_bytes == EXAMPLE_BUFF_SIZE) {
+    /* Here we load the target buffer repeatedly, until all the DMA buffers are
+     * preloaded */
+    ESP_ERROR_CHECK(
+        i2s_channel_preload_data(tx_chan, w_buf, EXAMPLE_BUFF_SIZE, &w_bytes));
+  }
+
+  /* Enable the TX channel */
+  ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
+  while (1) {
+    /* Write i2s data */
+    if (i2s_channel_write(tx_chan, w_buf, EXAMPLE_BUFF_SIZE, &w_bytes, 1000) ==
+        ESP_OK) {
+      // printf("Write Task: i2s write %d bytes\n", w_bytes);
+    } else {
+      // printf("Write Task: i2s write failed\n");
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  free(w_buf);
+  vTaskDelete(NULL);
+}
+
+#define VOLUME_THRESHOLD 8388000 // 峰值阈值，根据实际调
+static int servo_state = 0;    // 0 → 0°，1 → 180°
+
+static int trigger_ident = 0;
+
+static void servo_set_angle(int angle) {
+  uint32_t duty = angle_to_duty(angle);
+  ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty);
+  ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
+}
+
+static void i2s_example_read_task(void *arg) {
+  uint8_t *buf = calloc(1, EXAMPLE_BUFF_SIZE);
+  assert(buf);
+  ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+
+  while (1) {
+    size_t r_bytes = 0;
+    if (i2s_channel_read(rx_chan, buf, EXAMPLE_BUFF_SIZE, &r_bytes, 1000) ==
+            ESP_OK &&
+        r_bytes > 0) {
+      // 把每 4 字节当作一个 MSB-aligned int32，右移 8 位
+      int32_t *samples = (int32_t *)buf;
+      size_t frames = r_bytes / 4;
+      int32_t peak = 0;
+      for (size_t i = 0; i < frames; i++) {
+        int32_t s = samples[i] >> 8;
+        if (abs(s) > peak)
+          peak = abs(s);
+      }
+      ESP_LOGI(TAG, "Volume %d", peak);
+
+      // 超过阈值且上一次没触发过，就切换一次
+      if (peak < VOLUME_THRESHOLD) {
+        if (trigger_ident == 0) {
+          servo_state = 1 - servo_state;
+          servo_set_angle(servo_state ? 180 : 0);
+          ESP_LOGI(TAG, "Volume %d > %d, toggle servo to %d°", peak,
+                   VOLUME_THRESHOLD, servo_state ? 180 : 0);
+          trigger_ident = 2;
+        }
+      } else {
+        if (trigger_ident > 0) {
+          trigger_ident--;
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  free(buf);
+  vTaskDelete(NULL);
+}
+
+// static void i2s_example_read_task(void *args) {
+//   uint8_t *r_buf = (uint8_t *)calloc(1, EXAMPLE_BUFF_SIZE);
+//   assert(r_buf); // Check if r_buf allocation success
+//   size_t r_bytes = 0;
+//
+//   /* Enable the RX channel */
+//   ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+//
+//   /* ATTENTION: The print and delay in the read task only for monitoring the
+//    * data by human, Normally there shouldn't be any delays to ensure a short
+//    * polling time, Otherwise the dma buffer will overflow and lead to the
+//    data
+//    * lost */
+//   while (1) {
+//     /* Read i2s data */
+//     if (i2s_channel_read(rx_chan, r_buf, EXAMPLE_BUFF_SIZE, &r_bytes, 1000)
+//     ==
+//         ESP_OK) {
+//       printf(
+//           "Read Task: i2s read %d
+//           bytes\n-----------------------------------\n", r_bytes);
+//       printf("[0] %x [1] %x [2] %x [3] %x\n[4] %x [5] %x [6] %x [7] %x\n\n",
+//              r_buf[0], r_buf[1], r_buf[2], r_buf[3], r_buf[4], r_buf[5],
+//              r_buf[6], r_buf[7]);
+//     } else {
+//       printf("Read Task: i2s read failed\n");
+//     }
+//     vTaskDelay(pdMS_TO_TICKS(200));
+//   }
+//   free(r_buf);
+//   vTaskDelete(NULL);
+// }
+
+static int s_retry_num = 0;
+
+static void event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data) {
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    esp_wifi_connect();
+  } else if (event_base == WIFI_EVENT &&
+             event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
+      esp_wifi_connect();
+      s_retry_num++;
+      ESP_LOGI(TAG, "retry to connect to the AP");
+    } else {
+      xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+    }
+    ESP_LOGI(TAG, "connect to the AP fail");
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+    ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+    s_retry_num = 0;
+    xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+  }
+}
+
+void wifi_init_sta(void) {
+  s_wifi_event_group = xEventGroupCreate();
+
+  ESP_ERROR_CHECK(esp_netif_init());
+
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_sta();
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+  esp_event_handler_instance_t instance_any_id;
+  esp_event_handler_instance_t instance_got_ip;
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
+
+  wifi_config_t wifi_config = {
+      .sta =
+          {
+              .ssid = EXAMPLE_ESP_WIFI_SSID,
+              .password = EXAMPLE_ESP_WIFI_PASS,
+              /* Authmode threshold resets to WPA2 as default if password
+               * matches WPA2 standards (password len => 8). If you want to
+               * connect the device to deprecated WEP/WPA networks, Please set
+               * the threshold value to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set
+               * the password with length and format matching to
+               * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
+               */
+              .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+              .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
+              .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
+          },
+  };
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_start());
+
+  ESP_LOGI(TAG, "wifi_init_sta finished.");
+
+  /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or
+   * connection failed for the maximum number of re-tries (WIFI_FAIL_BIT). The
+   * bits are set by event_handler() (see above) */
+  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                         pdFALSE, pdFALSE, portMAX_DELAY);
+
+  /* xEventGroupWaitBits() returns the bits before the call returned, hence we
+   * can test which event actually happened. */
+  if (bits & WIFI_CONNECTED_BIT) {
+    ESP_LOGI(TAG, "connected to ap SSID:%s password:%s", EXAMPLE_ESP_WIFI_SSID,
+             EXAMPLE_ESP_WIFI_PASS);
+  } else if (bits & WIFI_FAIL_BIT) {
+    ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
+             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+  } else {
+    ESP_LOGE(TAG, "UNEXPECTED EVENT");
+  }
+}
+
+static void servo_init(void) {
+  // 1）配置 PWM 定时器
+  ledc_timer_config_t timer = {
+      .speed_mode = SERVO_MODE,
+      .timer_num = SERVO_TIMER,
+      .duty_resolution = SERVO_RES_BITS,
+      .freq_hz = SERVO_FREQ_HZ,
+      .clk_cfg = LEDC_AUTO_CLK,
+  };
+  ESP_ERROR_CHECK(ledc_timer_config(&timer));
+
+  // 2）配置 PWM 通道
+  ledc_channel_config_t ch = {
+      .speed_mode = SERVO_MODE,
+      .channel = SERVO_CHANNEL,
+      .timer_sel = SERVO_TIMER,
+      .intr_type = LEDC_INTR_DISABLE,
+      .gpio_num = SERVO_GPIO,
+      .duty = 0, // 先 0 占空比
+      .hpoint = 0,
+  };
+  ESP_ERROR_CHECK(ledc_channel_config(&ch));
+}
+
+static esp_err_t led_on_handler(httpd_req_t *req) {
   ESP_LOGI(TAG, "ON");
-    // gpio_set_level(LED_GPIO, 1);
-    // httpd_resp_sendstr(req, "LED is ON");
-    return ESP_OK;
+  // gpio_set_level(LED_GPIO, 1);
+  // httpd_resp_sendstr(req, "LED is ON");
+  return ESP_OK;
 }
 
-static esp_err_t led_off_handler(httpd_req_t *req)
-{
+static esp_err_t led_off_handler(httpd_req_t *req) {
   ESP_LOGI(TAG, "OFF");
-    // gpio_set_level(LED_GPIO, 0);
-    // httpd_resp_sendstr(req, "LED is OFF");
-    return ESP_OK;
+  // gpio_set_level(LED_GPIO, 0);
+  // httpd_resp_sendstr(req, "LED is OFF");
+  return ESP_OK;
 }
 
-static esp_err_t lighton_handler(httpd_req_t *req)
-{
-    uint32_t duty = angle_to_duty(0);
-    ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty);
-    ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
-    httpd_resp_sendstr(req, "Servo to 0°");
-    return ESP_OK;
+static esp_err_t lighton_handler(httpd_req_t *req) {
+  uint32_t duty = angle_to_duty(0);
+  ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty);
+  ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
+  httpd_resp_sendstr(req, "Servo to 0°");
+  return ESP_OK;
 }
 
-static esp_err_t lightoff_handler(httpd_req_t *req)
-{
-    uint32_t duty = angle_to_duty(180);
-    ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty);
-    ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
-    httpd_resp_sendstr(req, "Servo to 180°");
-    return ESP_OK;
+static esp_err_t lightoff_handler(httpd_req_t *req) {
+  uint32_t duty = angle_to_duty(180);
+  ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty);
+  ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
+  httpd_resp_sendstr(req, "Servo to 180°");
+  return ESP_OK;
 }
 
-static httpd_handle_t start_webserver(void)
-{
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    // config.server_port = 80;
+static httpd_handle_t start_webserver(void) {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  // config.server_port = 80;
 
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "启动 HTTP Server 失败");
-        return NULL;
-    }
+  httpd_handle_t server = NULL;
+  if (httpd_start(&server, &config) != ESP_OK) {
+    ESP_LOGE(TAG, "启动 HTTP Server 失败");
+    return NULL;
+  }
 
-    httpd_uri_t uri_on = {
-        .uri       = "/ledon",
-        .method    = HTTP_GET,
-        .handler   = led_on_handler,
-        .user_ctx  = NULL
-    };
-    httpd_register_uri_handler(server, &uri_on);
+  httpd_uri_t uri_on = {.uri = "/ledon",
+                        .method = HTTP_GET,
+                        .handler = led_on_handler,
+                        .user_ctx = NULL};
+  httpd_register_uri_handler(server, &uri_on);
 
-    httpd_uri_t uri_off = {
-        .uri       = "/ledoff",
-        .method    = HTTP_GET,
-        .handler   = led_off_handler,
-        .user_ctx  = NULL
-    };
-    httpd_register_uri_handler(server, &uri_off);
+  httpd_uri_t uri_off = {.uri = "/ledoff",
+                         .method = HTTP_GET,
+                         .handler = led_off_handler,
+                         .user_ctx = NULL};
+  httpd_register_uri_handler(server, &uri_off);
 
-    // 注册 /lighton 和 /lightoff
-    httpd_uri_t on_uri = {
-        .uri       = "/lighton",
-        .method    = HTTP_GET,
-        .handler   = lighton_handler,
-        .user_ctx  = NULL
-    };
-    httpd_register_uri_handler(server, &on_uri);
+  // 注册 /lighton 和 /lightoff
+  httpd_uri_t on_uri = {.uri = "/lighton",
+                        .method = HTTP_GET,
+                        .handler = lighton_handler,
+                        .user_ctx = NULL};
+  httpd_register_uri_handler(server, &on_uri);
 
-    httpd_uri_t off_uri = {
-        .uri       = "/lightoff",
-        .method    = HTTP_GET,
-        .handler   = lightoff_handler,
-        .user_ctx  = NULL
-    };
-    httpd_register_uri_handler(server, &off_uri);
+  httpd_uri_t off_uri = {.uri = "/lightoff",
+                         .method = HTTP_GET,
+                         .handler = lightoff_handler,
+                         .user_ctx = NULL};
+  httpd_register_uri_handler(server, &off_uri);
 
-    return server;
+  return server;
 }
 
-void app_main(void)
-{
-    //Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
+void app_main(void) {
+  // Initialize NVS
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(ret);
 
-    if (CONFIG_LOG_MAXIMUM_LEVEL > CONFIG_LOG_DEFAULT_LEVEL) {
-        /* If you only want to open more logs in the wifi module, you need to make the max level greater than the default level,
-         * and call esp_log_level_set() before esp_wifi_init() to improve the log level of the wifi module. */
-        esp_log_level_set("wifi", CONFIG_LOG_MAXIMUM_LEVEL);
-    }
+  // if (CONFIG_LOG_MAXIMUM_LEVEL > CONFIG_LOG_DEFAULT_LEVEL) {
+  //   /* If you only want to open more logs in the wifi module, you need to
+  //   make
+  //    * the max level greater than the default level, and call
+  //    * esp_log_level_set() before esp_wifi_init() to improve the log level of
+  //    * the wifi module. */
+  //   esp_log_level_set("wifi", CONFIG_LOG_MAXIMUM_LEVEL);
+  // }
 
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
-    servo_init();
-    ESP_LOGI(TAG, "Servo PWM initialized on GPIO %d", SERVO_GPIO);
+  ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+  servo_init();
+  ESP_LOGI(TAG, "Servo PWM initialized on GPIO %d", SERVO_GPIO);
 
-    wifi_init_sta();
+  i2s_init_std_duplex();
+  ESP_LOGI(TAG, "I2S initialized");
+  xTaskCreate(i2s_example_read_task, "i2s_example_read_task", 4096, NULL, 5,
+              NULL);
+  xTaskCreate(i2s_example_write_task, "i2s_example_write_task", 4096, NULL, 5,
+              NULL);
 
-    httpd_handle_t server = start_webserver();
+  wifi_init_sta();
 
-    if (server) {
-        ESP_LOGI(TAG, "HTTP Server started");
-    }
+  httpd_handle_t server = start_webserver();
 
+  if (server) {
+    ESP_LOGI(TAG, "HTTP Server started");
+  }
 }
