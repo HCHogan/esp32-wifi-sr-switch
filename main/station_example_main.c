@@ -101,6 +101,8 @@ static const char *TAG = "wifi station";
 static i2s_chan_handle_t tx_chan; // I2S tx channel handler
 static i2s_chan_handle_t rx_chan; // I2S rx channel handler
 
+static bool mic_enabled = true; // 麦克风控制开关
+
 // 将角度映射到占空比（10-bit，0‥1023）
 static uint32_t angle_to_duty(int angle_deg) {
   // 0° → 0.5ms ; 180° → 2.5ms ; 周期 = 20ms
@@ -193,7 +195,7 @@ static void i2s_example_write_task(void *args) {
 }
 
 #define VOLUME_THRESHOLD 8388000 // 峰值阈值，根据实际调
-static int servo_state = 0;    // 0 → 0°，1 → 180°
+static int servo_state = 0;      // 0 → 0°，1 → 180°
 
 static int trigger_ident = 0;
 
@@ -212,7 +214,7 @@ static void i2s_example_read_task(void *arg) {
     size_t r_bytes = 0;
     if (i2s_channel_read(rx_chan, buf, EXAMPLE_BUFF_SIZE, &r_bytes, 1000) ==
             ESP_OK &&
-        r_bytes > 0) {
+        r_bytes > 0 && mic_enabled) {
       // 把每 4 字节当作一个 MSB-aligned int32，右移 8 位
       int32_t *samples = (int32_t *)buf;
       size_t frames = r_bytes / 4;
@@ -231,7 +233,7 @@ static void i2s_example_read_task(void *arg) {
           servo_set_angle(servo_state ? 180 : 0);
           ESP_LOGI(TAG, "Volume %d > %d, toggle servo to %d°", peak,
                    VOLUME_THRESHOLD, servo_state ? 180 : 0);
-          trigger_ident = 2;
+          trigger_ident = 10;
         }
       } else {
         if (trigger_ident > 0) {
@@ -394,6 +396,57 @@ static esp_err_t led_on_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+static esp_err_t root_get_handler(httpd_req_t *req) {
+  const char *servo_str = servo_state ? "180°" : "0°";
+  const char *mic_str = mic_enabled ? "Enabled" : "Disabled";
+
+  const char *html_fmt = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                         "<title>Control Panel</title></head><body>"
+                         "<h1>Servo Position: %s</h1>"
+                         "<form action=\"/toggle\" method=\"get\">"
+                         "  <button type=\"submit\">Toggle Servo</button>"
+                         "</form>"
+                         "<h1>Microphone Control: %s</h1>"
+                         "<form action=\"/toggle_mic\" method=\"get\">"
+                         "  <button type=\"submit\">Toggle Microphone</button>"
+                         "</form>"
+                         "</body></html>";
+
+  char *resp = malloc(512);
+  if (!resp)
+    return ESP_FAIL;
+  snprintf(resp, 512, html_fmt, servo_str, mic_str);
+
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_sendstr(req, resp);
+  free(resp);
+  return ESP_OK;
+}
+
+// 新增：切换麦克风控制开关
+static esp_err_t toggle_mic_handler(httpd_req_t *req) {
+  mic_enabled = !mic_enabled;
+  ESP_LOGI(TAG, "Microphone control %s", mic_enabled ? "Enabled" : "Disabled");
+
+  httpd_resp_set_status(req, "303 See Other");
+  httpd_resp_set_hdr(req, "Location", "/");
+  httpd_resp_sendstr(req, "");
+  return ESP_OK;
+}
+
+// 切换舵机状态并重定向回 "/"
+static esp_err_t toggle_handler(httpd_req_t *req) {
+  // 切换状态
+  servo_state = 1 - servo_state;
+  servo_set_angle(servo_state ? 180 : 0);
+
+  // 303 重定向到根页面，浏览器会自动发 GET /
+  httpd_resp_set_status(req, "303 See Other");
+  httpd_resp_set_hdr(req, "Location", "/");
+  httpd_resp_sendstr(req, "");
+  return ESP_OK;
+}
+
 static esp_err_t led_off_handler(httpd_req_t *req) {
   ESP_LOGI(TAG, "OFF");
   // gpio_set_level(LED_GPIO, 0);
@@ -426,6 +479,27 @@ static httpd_handle_t start_webserver(void) {
     ESP_LOGE(TAG, "启动 HTTP Server 失败");
     return NULL;
   }
+
+  // 切换麦克风控制
+  httpd_uri_t togg_mic = {.uri = "/toggle_mic",
+                          .method = HTTP_GET,
+                          .handler = toggle_mic_handler,
+                          .user_ctx = NULL};
+  httpd_register_uri_handler(server, &togg_mic);
+
+  // 根目录
+  httpd_uri_t root = {.uri = "/",
+                      .method = HTTP_GET,
+                      .handler = root_get_handler,
+                      .user_ctx = NULL};
+  httpd_register_uri_handler(server, &root);
+
+  // 切换舵机
+  httpd_uri_t toggle = {.uri = "/toggle",
+                        .method = HTTP_GET,
+                        .handler = toggle_handler,
+                        .user_ctx = NULL};
+  httpd_register_uri_handler(server, &toggle);
 
   httpd_uri_t uri_on = {.uri = "/ledon",
                         .method = HTTP_GET,
