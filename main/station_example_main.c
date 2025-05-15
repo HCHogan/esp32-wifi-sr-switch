@@ -25,8 +25,6 @@
 
 #include "esp_http_server.h"
 
-#include "hiesp.h"
-
 /* The examples use WiFi configuration that you can set via project
    configuration menu
 
